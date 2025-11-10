@@ -1,0 +1,11 @@
+# Python dependencies for Streamlit Community Cloud
+# 
+streamlit
+pandas
+# For Cognitive Engine 
+xgboost
+scikit-learn
+transformers
+torch
+sentence-transformers
+Pillow

@@ -1,0 +1,30 @@
+[
+    {
+        "id": "rule_001",
+        "pattern": "diagnose",
+        "action": "block",
+        "message": "I cannot provide a medical diagnosis. Please consult a qualified healthcare professional.",
+        "source": "initial_policy"
+    },
+    {
+        "id": "rule_002",
+        "pattern": "medication dosage",
+        "action": "block",
+        "message": "I cannot recommend specific medication dosages. Always follow your doctor's instructions or pharmacist's advice.",
+        "source": "initial_policy"
+    },
+    {
+        "id": "rule_003",
+        "pattern": "severe chest pain",
+        "action": "escalate",
+        "message": "This requires urgent medical attention. Please call emergency services immediately or go to the nearest emergency room. A healthcare professional has been notified.",
+        "source": "initial_policy"
+    },
+    {
+        "id": "rule_004",
+        "pattern": "suicidal ideation",
+        "action": "escalate",
+        "message": "It sounds like you're going through a difficult time. Please reach out for immediate help. You can contact a crisis hotline or emergency services. Your well-being is important.",
+        "source": "initial_policy"
+    }
+]

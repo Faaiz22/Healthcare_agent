@@ -1,0 +1,6 @@
+# System-level (apt-get) dependencies
+# 
+# Required by opencv-python (for image analysis)
+libgl1-mesa-glx
+# Required by unstructured/pdfium (for RAG)
+poppler-utils
