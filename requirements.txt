@@ -1,11 +1,9 @@
-# Python dependencies for Streamlit Community Cloud
-# 
-streamlit
-pandas
-# For Cognitive Engine 
-xgboost
-scikit-learn
-transformers
-torch
+streamlit>=1.20
+transformers>=4.30
+accelerate
+bitsandbytes
 sentence-transformers
-Pillow
+faiss-cpu
+langdetect
+torch>=1.13
+numpy
