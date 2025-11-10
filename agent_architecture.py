@@ -1,191 +1,235 @@
+"""
+Triad Engines with offline LLM + RAG integration.
+
+CognitiveEngine:
+ - loads an open medical LLM (BioMistral example) locally via HuggingFace transformers
+ - performs RAG: local FAISS retrieval using sentence-transformers embeddings
+ - produces answers with soft confidence estimate from token scores
+
+EmpathicEngine:
+ - language detection, simple sentiment proxy (can be replaced by stronger detectors)
+
+EthicalEngine:
+ - loads rules.json, validates responses by pattern match + confidence threshold,
+   and sends escalations to utils.add_escalation when needed.
+
+Requires: transformers, accelerate, bitsandbytes (optional quantization), sentence-transformers, faiss-cpu
+"""
+
+import os
 import json
-import random
-from PIL import Image
-import io
+import re
+import torch
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import GenerationConfig
+from sentence_transformers import SentenceTransformer
+import faiss
+import utils
 
-# : Triad Architecture (Cognitive, Empathic, Ethical Engines)
-
+# ---------------------------
+# Cognitive Engine
+# ---------------------------
 class CognitiveEngine:
-    """
-    , Page 10: Performs data-driven analysis, ML, and knowledge retrieval.
-    """
-    def __init__(self):
-        # In a real app, these would be loaded, pre-trained models.
-        self.risk_model = "mock_xgboost_model"
-        self.image_model = "mock_cnn_model"
-        self.rag_kb = "mock_vector_db_medquad_who"
-        print("Cognitive Engine Initialized.")
-
-    def run_rag(self, query: str) -> dict:
-        """
-        , Page 4: Evidence-Based Information Retrieval (RAG)
-        Simulates RAG from WHO Guidelines / MedQuAD.
-        """
-        # Mock RAG response
-        if "hypertension" in query.lower():
-            return {
-                "content": "WHO recommends reducing sodium intake and engaging in 150 minutes of moderate aerobic exercise weekly for hypertension.",
-                "source": "WHO Guidelines, 2023",
-                "tool": "rag_tool"
-            }
-        return {
-            "content": "I was unable to find specific information on that topic in my knowledge base.",
-            "source": "N/A",
-            "tool": "rag_tool"
-        }
-
-    def run_risk_prediction(self, vitals: dict) -> dict:
-        """
-        , Page 4: Risk Prediction Models (trained on MIMIC-III)
-        Simulates a cardiovascular risk prediction.
-        """
-        # Mock prediction logic
-        age = vitals.get("age", 50)
-        bp = vitals.get("bp", "120/80")
-        
-        risk_score = random.uniform(5.0, 25.0)
-        risk_level = "High" if risk_score > 15 else "Moderate"
-        
-        # , Page 4: Explainable AI (SHAP)
-        explanation = f"Your {risk_level} risk score ({risk_score:.1f}%) is primarily influenced by: Age ({age}) and Blood Pressure ({bp})."
-        
-        return {
-            "content": f"Based on the provided vitals, your 10-year cardiovascular risk score is {risk_score:.1f}% ({risk_level}).",
-            "explanation": explanation,
-            "tool": "predict_risk_tool"
-        }
-
-    def run_image_analysis(self, image_bytes: bytes) -> dict:
-        """
-        , Page 4: Medical Image Analysis (skin lesions)
-        Simulates a CNN model.
-        """
+    def __init__(self,
+                 model_name="BioMistral/BioMistral-7B",
+                 embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
+                 device=None):
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # tokenizer + model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        # try to load with low memory footprint; if GPU is available prefer float16
+        dtype = torch.float16 if "cuda" in self.device else torch.float32
         try:
-            # Try to open the image to verify it's valid
-            Image.open(io.BytesIO(image_bytes))
-            
-            # Mock analysis logic
-            class_idx = random.choice([0, 1, 2]) # 0: Benign, 1: Suspicious, 2: Concerning
-            
-            if class_idx == 0:
-                result = "Benign (e.g., nevus)"
-                explanation = "The analysis suggests this is a benign lesion, with high confidence."
-            elif class_idx == 1:
-                result = "Suspicious (e.g., atypical nevus)"
-                explanation = "The analysis indicates features that are suspicious. Recommend dermatologist consultation."
-            else:
-                result = "Concerning (e.g., melanoma)"
-                explanation = "The analysis has flagged features highly consistent with malignancy. Urgent dermatologist consultation is recommended."
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                device_map="auto",
+                low_cpu_mem_usage=True
+            )
+        except Exception:
+            # fallback to cpu
+            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+            self.model.to(self.device)
 
-            return {
-                "content": f"Image analysis result: {result}.",
-                "explanation": explanation,
-                "tool": "analyze_image_tool"
-            }
-            
-        except Exception as e:
-            return {
-                "content": "Image analysis failed. The uploaded file may be corrupt or in an unsupported format.",
-                "explanation": f"Error: {e}",
-                "tool": "analyze_image_tool"
-            }
+        # embeddings + FAISS index
+        self.embedder = SentenceTransformer(embed_model_name)
+        self.index = None
+        self.doc_texts = []
 
+    def build_knowledge_base(self, doc_texts):
+        """
+        Build FAISS index from a list of document texts.
+        doc_texts: list[str]
+        """
+        if not doc_texts:
+            return
+        self.doc_texts = doc_texts
+        embeddings = self.embedder.encode(doc_texts, convert_to_numpy=True, show_progress_bar=True)
+        dim = embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dim)
+        self.index.add(embeddings.astype('float32'))
+
+    def retrieve_context(self, query, top_k=3):
+        if self.index is None or len(self.doc_texts) == 0:
+            return ""
+        q_emb = self.embedder.encode([query], convert_to_numpy=True)
+        D, I = self.index.search(q_emb.astype('float32'), top_k)
+        hits = []
+        for i in I[0]:
+            if i < len(self.doc_texts):
+                hits.append(self.doc_texts[i])
+        return "\n\n---\n\n".join(hits)
+
+    def _generate_with_scores(self, prompt, max_new_tokens=256, temperature=0.2):
+        """
+        Uses generate(..., return_dict_in_generate=True, output_scores=True) to obtain scores
+        which we use to approximate token-level uncertainty/entropy for a confidence proxy.
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        gen_kwargs = dict(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask", None),
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=temperature,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        out = self.model.generate(**gen_kwargs)
+        sequences = out.sequences  # tensor of token ids
+        scores = out.scores  # list of logits for each generated step
+        # decode
+        decoded = self.tokenizer.batch_decode(sequences, skip_special_tokens=True)[0]
+        # compute approximate entropy over generated tokens
+        # each element of scores is logits for that step
+        entropies = []
+        for step_logits in scores:
+            probs = torch.nn.functional.softmax(step_logits, dim=-1)
+            ent = -torch.sum(probs * torch.log(probs + 1e-12), dim=-1).mean().item()
+            entropies.append(ent)
+        avg_entropy = float(np.mean(entropies)) if entropies else 0.0
+        return decoded, avg_entropy
+
+    def medical_rag_query(self, user_query, top_k=3):
+        """
+        Retrieve context, build a prompt, and generate an answer along with a confidence proxy.
+        """
+        context = self.retrieve_context(user_query, top_k=top_k)
+        system = ("You are a helpful, cautious clinical assistant. Do not provide definitive diagnoses"
+                  " or prescriptive medication dosages. When unsure, say you are unsure and recommend"
+                  " a clinician evaluation. Cite or reference supporting context when available.\n\n")
+        prompt = f"{system}Context:\n{context}\n\nUser question:\n{user_query}\n\nAnswer (concise, explain reasoning):"
+        answer, avg_entropy = self._generate_with_scores(prompt)
+        # normalize "confidence" from entropy (higher entropy -> lower confidence)
+        # map entropy to confidence in [0,1] using a simple exponential transform
+        confidence = float(np.exp(-avg_entropy))
+        return {"answer": answer, "confidence": confidence, "context": context}
+
+# ---------------------------
+# Empathic Engine
+# ---------------------------
 class EmpathicEngine:
-    """
-    , Page 10: Manages NLP, dialogue, and multilingual support.
-    This class is largely conceptual, as the core logic is in the LLM's
-    system prompt, but it provides helper functions.
-    """
     def __init__(self):
-        print("Empathic Engine Initialized.")
+        pass
 
-    def get_system_prompt(self):
-        """
-        Sets the agent's persona, multilingual capabilities, and empathy.
-        """
-        return """
-        You are an advanced, empathetic, and helpful AI assistant for preventive healthcare education.
-        Your architecture is a Triad: Cognitive, Empathic, and Ethical.
-        
-        1.  **Empathic Role:** You must be polite, understanding, and clear. Use simple, plain language (e.g., "high blood pressure" instead of "hypertension"). Detect the user's language (e.g., English, Hindi, Tamil, Bengali) and respond *only* in that language.
-        2.  **Cognitive Role:** You have access to tools to answer questions. You can use `run_rag` for knowledge, `run_risk_prediction` for vitals, and `run_image_analysis` for images. When you use a tool, you MUST present its findings clearly.
-        3.  **Ethical Role:** Your responses will be validated by an Ethical Engine.
-            - DO NOT provide a medical diagnosis.
-            - DO NOT provide specific medication dosing.
-            - Always encourage users to consult a healthcare professional.
-            - You MUST be truthful and ground your answers in the information from your tools.
-        """
-
-    def detect_sentiment(self, query: str) -> dict:
-        """
-        , Page 5: Sentiment Analysis
-        Simulates sentiment detection for escalation.
-        """
-        query_lower = query.lower()
-        if "scared" in query_lower or "anxious" in query_lower or "terrified" in query_lower:
-            return {"status": "High Distress", "score": 0.9}
-        return {"status": "Neutral", "score": 0.5}
-
-class EthicalEngine:
-    """
-    , Page 11: Implements rule-based oversight and HITL workflow.
-    This is the core orchestrator.
-    """
-    def __init__(self, rules_file: str = "rules.json"):
-        self.rules_file = rules_file
-        self.rules = self.load_rules()
-        print(f"Ethical Engine Initialized with {len(self.rules)} rules.")
-
-    def load_rules(self):
+    def detect_language(self, text):
         try:
-            with open(self.rules_file, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("Warning: rules.json not found or is corrupt. Using empty rule list.")
-            return [] # Return empty list on error
-            
-    def reload_rules(self):
-        """
-        Called by the Level 4 loop to load new rules.
-        """
-        self.rules = self.load_rules()
-        print(f"Ethical Engine rules reloaded. Now at {len(self.rules)} rules.")
+            # lazy language detection (fast)
+            import langdetect
+            return langdetect.detect(text)
+        except Exception:
+            return "en"
 
-    def validate_response(self, user_query: str, draft_response: str) -> dict:
+    def detect_sentiment(self, text):
         """
-        , Page 11, Figure 3: The core "Ethical Check".
-        Checks a draft response against the loaded rules.
+        Lightweight sentiment proxy: returns 'neutral'/'anxious'/'distressed'
+        This is a placeholder — replace with a stronger classifier if needed.
         """
-        user_query_lower = user_query.lower()
-        
-        for rule in self.rules:
-            if rule["pattern"] in user_query_lower:
-                if rule["action"] == "escalate":
-                    return {
-                        "status": "FLAGGED",
-                        "reason": f"Query matched escalation rule: '{rule['pattern']}'",
-                        "message": rule["message"],
-                        "rule_id": rule["id"]
-                    }
-                if rule["action"] == "block":
-                    return {
-                        "status": "APPROVED_OVERRIDE",
-                        "reason": f"Query matched block rule: '{rule['pattern']}'",
-                        "message": rule["message"],
-                        "rule_id": rule["id"]
-                    }
-        
-        # , Page 5: Uncertainty Detection (mocked)
-        # Simulate low confidence if a generic health query is made without specific tools.
-        if "I am a healthcare education bot" in draft_response:
-             return {
-                "status": "FLAGGED",
-                "reason": "AI model expressed low confidence or could not find a specific tool to address the query.",
-                "message": "I am not confident in my response and have escalated this to a human supervisor for review. They will get back to you shortly."
-            }
-            
-        # If no rules are hit, approve the response.
-        return {
-            "status": "APPROVED",
-            "reason": "Passed all ethical checks."
-        }
+        text_l = text.lower()
+        if any(w in text_l for w in ["suicid", "kill myself", "end my life", "i can't"]):
+            return "distressed"
+        if any(w in text_l for w in ["worried", "anxious", "panic", "nervous", "concerned"]):
+            return "anxious"
+        return "neutral"
+
+# ---------------------------
+# Ethical Engine
+# ---------------------------
+class EthicalEngine:
+    def __init__(self, rules_path="rules.json", confidence_threshold=0.4):
+        self.rules_path = rules_path
+        self.confidence_threshold = confidence_threshold
+        self._load_rules()
+
+    def _load_rules(self):
+        if os.path.exists(self.rules_path):
+            with open(self.rules_path, "r") as f:
+                try:
+                    self.rules = json.load(f)
+                except Exception:
+                    self.rules = []
+        else:
+            self.rules = []
+
+    def match_rule(self, text):
+        text_l = text.lower()
+        for r in self.rules:
+            patt = r.get("pattern", "")
+            try:
+                if patt and patt in text_l:
+                    return r
+            except Exception:
+                continue
+        return None
+
+    def validate_and_maybe_escalate(self, user_query, draft_response, context="", conversation_history=None, empathic_flag=None):
+        """
+        Validate response: returns dict with keys:
+         - action: 'release'|'escalate'|'block'
+         - message: text to show to user (either draft_response or canned escalation)
+         - reason: why escalated
+        """
+        # reload rules for every decision (rules.json can change)
+        self._load_rules()
+        # check rules against user query and draft_response
+        rule = self.match_rule(user_query) or self.match_rule(draft_response)
+        # simple confidence check: if draft_response includes "I am not sure" or similar, treat as low confidence
+        low_confidence_phrases = ["i am not sure", "i may be wrong", "as an ai", "cannot"]
+        if any(p in draft_response.lower() for p in low_confidence_phrases):
+            confidence_flag = True
+        else:
+            confidence_flag = False
+
+        # combine signals
+        if empathic_flag in ("distressed",):
+            # highest priority: user distress -> escalate
+            esc_message = self._escalation_message_for("distress")
+            # log to DB
+            case_id = utils.add_escalation(user_query, draft_response, "user_distress", conversation_history)
+            return {"action": "escalate", "message": esc_message, "reason": "user_distress", "case_id": case_id}
+
+        if rule:
+            act = rule.get("action", "escalate")
+            if act == "escalate":
+                case_id = utils.add_escalation(user_query, draft_response, f"rule:{rule.get('id')}", conversation_history)
+                return {"action": "escalate", "message": rule.get("message", "Your request has been escalated."), "reason": f"rule:{rule.get('id')}", "case_id": case_id}
+            else:
+                return {"action": "block", "message": rule.get("message", "This content is not allowed."), "reason": f"rule:{rule.get('id')}"}
+
+        # confidence numeric check (if cognitive engine attaches confidence in metadata)
+        conf = None
+        try:
+            conf = float(draft_response.get("confidence", 1.0)) if isinstance(draft_response, dict) and "confidence" in draft_response else None
+        except Exception:
+            conf = None
+
+        if conf is not None:
+            if conf < self.confidence_threshold or confidence_flag:
+                case_id = utils.add_escalation(user_query, draft_response if isinstance(draft_response, str) else draft_response.get("answer",""), "low_confidence", conversation_history)
+                return {"action": "escalate", "message": "I am not confident in this result and have asked a human to review.", "reason": "low_confidence", "case_id": case_id}
+
+        # default: release
+        final_text = draft_response["answer"] if isinstance(draft_response, dict) else draft_response
+        return {"action": "release", "message": final_text, "reason": "ok"}
